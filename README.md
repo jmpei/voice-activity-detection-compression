@@ -41,7 +41,8 @@ Per-session F1 std ≈ 0.0156 · SEM ≈ 0.0035. Deltas below the SEM are within
 ```
 .
 ├── vad_experiment_colab.ipynb   # Main experiment notebook (run on Google Colab)
-├── vad_experiment_colab.py      # Python export of the notebook
+├── archive/
+│   └── vad_experiment_colab.py  # Archived Python export (no longer maintained)
 ├── report.md                    # Detailed technical report with analysis
 └── README.md
 ```
@@ -120,3 +121,17 @@ The CRDNN model's dominant layers (Conv2d, GRU) fall outside this scope:
 - **Conv2d**: not supported by `quantize_dynamic` at all.
 
 As a result, only the DNN head (1.2% of total parameters) is converted to INT8, yielding negligible size reduction.
+
+
+---
+
+## Update — RNN swap + static PTQ helpers (not yet run in Colab)
+
+Added scaffolding to `vad_experiment_colab.ipynb` for the next conditions (targets the 98.8% of weights dynamic PTQ couldn't reach). **Written but not yet executed in Colab — needs one run to confirm.**
+
+- `CRDNNWrapper(vad, rnn=...)` — optional RNN override; default still uses the pretrained GRU, so existing cells are unchanged. Feature front-end exposed as `wrapper.features(wav)`.
+- `build_lstm_like(rnn)` — fresh `nn.LSTM` matching the GRU's dims for a one-line GRU→LSTM swap (random weights; must be trained before its F1 means anything).
+- `static_ptq_module(module, calib_inputs)` — `prepare → calibrate → convert`; quantizes Conv2d (the CNN), which `quantize_dynamic` could not. GRU stays FP32.
+- `load_sessions("train")` + `build_calibration_set(...)` — calibration clips from the **train** split, disjoint from eval. Needs the train split present (DATA_MODE='full' or dataset/train/ in place).
+
+`vad_experiment_colab.py` moved to `archive/` and is no longer maintained — the notebook is the single source of truth.

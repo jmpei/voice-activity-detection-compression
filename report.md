@@ -173,3 +173,37 @@ return F.linear(x, w_ste, self.bias)
 torch.save(vad_obj.mods['model'].state_dict(), tmp_path)
 size_mb = os.path.getsize(tmp_path) / (1024 ** 2)
 ```
+
+
+---
+
+## Implementation log — RNN swap + static PTQ helpers added
+
+**Status: code written, not yet run in Colab.** I cannot execute SpeechBrain/torch here, so the cells below need one Colab run to confirm. Treat the static-PTQ helper especially as scaffolding — the eager-mode flow may need conv-bn fusion or FX-mode once the CNN's real structure is visible.
+
+What landed in `vad_experiment_colab.ipynb`:
+
+1. **`CRDNNWrapper` now takes `rnn=`** (cell: "FP32 Baseline — Load Model and Build Wrapper"). Default is unchanged (uses the pretrained GRU), so the FP32/PTQ/QAT cells behave exactly as before. The feature front-end was pulled out into `wrapper.features(wav)` so it can double as the calibration prep function.
+2. **New cell "RNN-type swap and static PTQ helpers"** (end of notebook) defines:
+   - `build_lstm_like(rnn)` — fresh `nn.LSTM` matching the GRU's dims. **Random weights** — the LSTM-FP32 reading is meaningless until it is trained. That training is the next step, not done here.
+   - `static_ptq_module(module, calib_inputs)` — `prepare → calibrate → convert`. Quantizes Conv2d (the CNN), which dynamic PTQ could not. GRU stays FP32.
+   - `load_sessions(split)` + `build_calibration_set(...)` — calibration clips from the **train** split, disjoint from the eval sessions used for F1. Returns nothing useful if the train split was not downloaded (DATA_MODE='small' may only fetch eval — set 'full' or drop dataset/train/ in place).
+
+The one-line GRU→LSTM swap:
+```python
+lstm = build_lstm_like(vad_fp32.mods['rnn'])
+wrapper_lstm = CRDNNWrapper(vad_fp32, rnn=lstm).eval()
+```
+
+Static PTQ on the CNN:
+```python
+calib = build_calibration_set(train_sessions, prep_fn=wrapper_fp32.features, n_clips=8)
+q_cnn = static_ptq_module(wrapper_fp32.cnn, calib)
+```
+
+**Also:** `vad_experiment_colab.py` moved to `archive/` — no longer maintained; the notebook is the single source of truth now.
+
+**Open risks to check on first Colab run:**
+- `build_lstm_like` reads dims off the live GRU via `find_torch_rnn`. If SpeechBrain wraps the GRU unusually, confirm input_size/hidden_size are read correctly and the LSTM output width feeds the DNN.
+- `static_ptq_module` may leave float fallbacks or error at the quant/dequant boundary if the CNN has functional ops — that's the fusion/FX caveat above.
+- `build_calibration_set` assumes train WAVs are 16 kHz mono-extractable via `wav[0]`; verify sample rate.
