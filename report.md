@@ -73,50 +73,53 @@ Dynamic PTQ is a no-op on this architecture. QAT, scoped to where dynamic PTQ ca
 
 The first pass above was measured on x86 Google Colab. Its own latency numbers exposed why that is the wrong place to measure: the PTQ+QAT condition reported a **P95 of 326 ms against a 54 ms median** — a 6× tail spike that reflects noisy-neighbour contention on Colab's shared, virtualised CPU, not anything about the model. Latency on a shared host is not reproducible, and the whole point of the second pass is a size–latency–F1 table that can be defended.
 
-So from the second pass onward every condition is re-run on a local Apple-Silicon (arm64) MacBook. Three reasons: (1) a dedicated machine gives reproducible latency with no shared-CPU contention; (2) arm64 matches the iPhone deployment target, so the `qnnpack` quantized backend and the measured latencies are representative of what ships; (3) Core ML conversion (§4.5) requires macOS regardless. The payoff is visible immediately — re-running the baseline locally gives **12.9 ms median with P95 ≈ median + 0.6 ms**, versus 49.8 ms and a 326 ms tail on Colab: roughly 4× faster and with the tail noise gone.
+So from the second pass onward every condition is re-run on a local Apple-Silicon (arm64) MacBook. Three reasons: (1) a dedicated machine gives reproducible latency with no shared-CPU contention; (2) arm64 matches the iPhone deployment target, so the `qnnpack` quantized backend and the measured latencies are representative of what ships; (3) Core ML conversion (§4.4) requires macOS regardless. The payoff is visible immediately — re-running the baseline locally gives **12.9 ms median with P95 ≈ median + 0.6 ms**, versus 49.8 ms and a 326 ms tail on Colab: roughly 4× faster and with the tail noise gone.
 
 The trade-off is that **latencies are no longer comparable to the first-pass Colab numbers** in §3's table, so all conditions (E0–E6) are re-run locally for one consistent table. F1 is unaffected by the platform and reproduces exactly (FP32 0.9587, dynamic PTQ 0.9594), so the size and F1 comparisons carry over. The re-run also tightens two things in the QAT conditions: fine-tuning now draws calibration clips from the **train** split rather than the eval sessions (the first pass fine-tuned on eval, a leak), and clip sampling is **seeded** so E1b/E1c are reproducible. With those fixes the local QAT readings are E1b F1 0.852 and E1c F1 0.873 — both still well below the 0.959 baseline, confirming §3.2's finding that QAT scoped to the 1.2 % `nn.Linear` only hurts.
 
 ---
 
-## 4. Second pass: a plan that targets the 98.8 % we missed
+## 4. Second pass: what worked
 
-The next phase is organised as two tracks — quantization and distillation — that combine into one final condition. Every new condition keeps the same E0 evaluation protocol so the table at the end is directly comparable.
+The second pass runs the two tracks the first pass pointed to — quantization and distillation — on the local arm64 machine (§3.4). Every condition uses the same protocol as E0 (frame-level F1 over the 20-session LibriParty eval split; latency = median of 100 single-thread CPU runs after warm-up), so the table below is one-platform comparable. For the architecture-changed and distilled conditions (E2–E6), F1 is computed through SpeechBrain's own post-processing (`get_speech_prob_file → apply_threshold → get_boundaries`) with only the neural sub-modules swapped — a path validated to reproduce the native pipeline bit-for-bit — so those numbers sit on the same scale as E0–E1c.
 
-### 4.1 Phase 0 — prerequisites
+| ID  | Method                                       | Size (MB) | Latency (ms) | F1     | Precision | Recall |
+| --- | -------------------------------------------- | --------- | ------------ | ------ | --------- | ------ |
+| E0  | FP32 baseline (GRU)                          | 0.435     | 12.9         | 0.9587 | 0.957     | 0.961  |
+| E1a | Dynamic PTQ                                  | 0.434     | 13.4         | 0.9594 | 0.959     | 0.960  |
+| E1b | QAT (DNN only)                               | 0.434     | 14.1         | 0.8518 | 0.997     | 0.747  |
+| E1c | PTQ + QAT (all sub-modules)                  | 0.434     | 12.2         | 0.8726 | 0.996     | 0.779  |
+| E2  | Static PTQ (CNN → INT8)                      | 0.397     | 13.3         | 0.9599 | 0.960     | 0.960  |
+| E3  | GRU → LSTM, FP32 (trained)                   | 0.545     | 11.9         | 0.9381 | 0.909     | 0.972  |
+| E4  | LSTM + static-PTQ CNN + dynamic-quant LSTM   | 0.185     | 17.4         | 0.9426 | 0.921     | 0.968  |
+| E5  | Distilled student (FP32)                     | 0.134     | 13.5         | 0.8671 | 0.790     | 0.973  |
+| E6  | Distilled student + PTQ                      | 0.050     | 13.8         | 0.8704 | 0.795     | 0.973  |
 
-Before any new condition runs, three pieces of infrastructure need to be in place:
+Per-session F1 SEM is ≈ 0.0035 on E0; deltas below that are within measurement noise.
 
-1. `CRDNNWrapper` is refactored to take the RNN type as a parameter (`gru` or `lstm`) so the architecture swap in §4.2 is a one-line change, not a separate model class.
-2. A static PTQ helper using `torch.ao.quantization` — the standard `prepare → calibrate → convert` flow with `fbgemm` on x86 and `qnnpack` on ARM.
-3. A calibration set: 100–200 frames sampled from the **train** split. Using eval frames for calibration is a common mistake that quietly inflates F1; the calibration data must be disjoint from the data used for the final F1 measurement.
+### 4.1 Quantization track (E2 → E3 → E4)
 
-### 4.2 Phase 1 — quantization track
+**E2 — static PTQ on the CNN.** Static quantization (eager-mode prepare → calibrate → convert, calibrated on the train split) reaches the Conv2d weights that dynamic PTQ could not. The CNN alone drops from 0.088 MB to 0.049 MB (−44 %) and F1 is unchanged (0.9599 vs 0.9587, within SEM). But the CNN is only ~20 % of the model, so the full-model size moves just 8.8 % (0.435 → 0.397 MB): the GRU still blocks the rest, exactly as §3 predicted.
 
-| ID  | Setup                              | What it tests                                                                                  |
-| --- | ---------------------------------- | ---------------------------------------------------------------------------------------------- |
-| E2  | Static PTQ on the GRU model        | Whether quantizing Conv2d activations gives a partial size win while GRU still blocks the rest. |
-| E3  | GRU → LSTM, FP32 (no quantization) | Isolation — the only way to attribute E4's F1 change to quantization rather than the LSTM swap. |
-| E4  | LSTM + static PTQ                  | The track's endpoint. Both Conv2d and LSTM are now quantizable. Expected ~100 KB on disk.       |
+**E3 — GRU → LSTM, FP32.** The GRU is the obstacle because `quantize_dynamic` supports `nn.LSTM` but not `nn.GRU`. E3 swaps in a fresh LSTM of matching dimensions and trains only the LSTM (CNN and DNN frozen) with BCE on the train split. This is the FP32 reference that isolates the architecture change from quantization, so any F1 movement in E4 is attributable to PTQ. It recovers to F1 0.9381, ~2 points below baseline. Two honest caveats: freezing the DNN — which was trained for GRU outputs — caps recovery (dev F1 plateaued near 0.83; the eval split is easier), and the LSTM is less consistent across sessions than the GRU (F1 std 0.036 vs 0.016). The FP32 LSTM is also *larger* than the GRU (0.545 MB) because an LSTM has four gates to the GRU's three — its size only falls once it is quantized.
 
-E3 is non-negotiable: without an LSTM-FP32 reading, any F1 movement in E4 is unattributable. Skipping it would leave the report with a result it cannot defend.
+**E4 — LSTM + PTQ.** With the LSTM in place the recurrent layer is finally quantizable: static PTQ on the CNN plus dynamic INT8 quantization on the LSTM (and the DNN head). This is the track's endpoint — 0.185 MB (−57 % vs baseline, −66 % vs the E3 FP32 LSTM) at F1 0.9426, statistically the same as E3, so quantization is essentially lossless here. Latency rises to 17.4 ms (from E3's 11.9 ms): dynamic INT8 adds per-call quantization overhead, and on matrices this small INT8 does not outrun FP32 on CPU. That is a real size-for-latency trade, not a free win.
 
-### 4.3 Phase 2 — distillation track
+### 4.2 Distillation track (E5 → E6)
 
-A smaller student network is trained to match the FP32 teacher (E0), then quantized.
+**E5 — distilled student, FP32.** A compact student (~33 k parameters, about a third of the teacher: CNN channels halved, LSTM hidden halved) is trained from scratch to match the FP32 teacher, with loss `α · soft-BCE(student/T, σ(teacher_logits/T)) · T² + (1 − α) · BCE(student, labels)`, α = 0.5, T = 2. At 0.134 MB it reaches F1 0.8671 — ~9 points below baseline. The student leans toward recall (0.973) over precision (0.790): it over-predicts speech, and its per-session variance is high (F1 std 0.072).
 
-| ID  | Setup                                                                                                                                                          |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| E5  | LSTM student with CNN channels × 0.5 and RNN hidden × 0.5. Loss: `α · KL(student/T, teacher/T) · T² + (1 − α) · BCE`. Starting hyperparameters: α = 0.5, T = 2. |
-| E6  | E5 + static PTQ. Expected the smallest condition in the table, on the order of 25–50 KB.                                                                       |
+**E6 — distilled student + PTQ.** Quantizing the student (static CNN, dynamic LSTM/head) gives the smallest condition in the study: **0.050 MB**, F1 0.8704 — again lossless relative to its FP32 parent.
 
-α and T are starting points, not commitments — both will be tuned on a validation slice before locking in E5's final F1 number.
+### 4.3 Reading the results
 
-### 4.4 Phase 3 — analysis
+The size–F1 Pareto front (`results/pareto_e0_e6.png`) splits cleanly:
 
-When E2–E6 are in, the report's results section is rewritten against the combined table (E0–E6 plus the E1 ablations) and a Pareto plot of size on a log axis against F1. The current §3 narrative becomes "what we tried first and why it didn't work"; the new results section becomes "what worked".
+- **E4 is the sweet spot.** 0.185 MB at F1 0.9426 — under the 200 KB target and within ~1.6 points of the FP32 baseline. The path that got there is the report's whole argument: dynamic PTQ was a no-op, so we changed the architecture (GRU → LSTM) to make the dominant weights quantizable, then quantized.
+- **E6 is the smallest, at a real cost.** 0.050 MB is 8.7× smaller than the baseline, but F1 falls ~9 points. Below ~100 KB the size–F1 trade-off steepens faster than distillation absorbs it.
+- **The first-pass conditions stay where they were.** E1a buys nothing (a no-op), and the QAT variants E1b/E1c are both large *and* low-F1 — the worst corner of the plot.
 
-### 4.5 Phase 4 — iPhone deployment
+### 4.4 iPhone deployment via Core ML (remaining)
 
 Core ML is the runtime, chosen because the deployment target is iOS — not because it is the best inference engine in general. The conversion path is:
 
@@ -126,30 +129,19 @@ trained PyTorch model
   → coremltools.convert  → .mlpackage
 ```
 
-Both `compute_units = CPU_ONLY` and `compute_units = CPU_AND_NE` are measured. The metrics reported on iPhone are:
-
-- parameter count,
-- `.mlpackage` size on disk,
-- cold-start latency (first inference, includes ANE compile),
-- steady-state latency (median of runs ≥ 11).
-
-Energy is intentionally out of scope. Cold-start matters because on iPhone the first inference after app launch dominates user-perceived latency; steady-state matters for sustained use.
-
-### 4.6 Minimum viable version
-
-If time runs out, E2 is the first cut: it is a useful diagnostic but not load-bearing for the narrative. The minimum path that still produces a defensible result is **E3 → E4 → E5 → E6**, with Phase 4 optional. The story is then "we couldn't shrink the GRU model with dynamic PTQ, so we changed the architecture and distilled it; here is the result."
+Both `compute_units = CPU_ONLY` and `compute_units = CPU_AND_NE` are to be measured, reporting parameter count, `.mlpackage` size on disk, cold-start latency (first inference, includes ANE compile), and steady-state latency (median of runs ≥ 11). Energy is out of scope. This step is **not yet run** — it is the remaining piece of the study (E4 is the natural candidate to convert; E6 if the smallest possible `.mlpackage` is wanted).
 
 ---
 
-## 5. What "done" looks like
+## 5. What "done" looks like — assessment
 
-The study is finished when:
+The study set three criteria:
 
-1. At least one condition (likely E4 or E6) has on-disk size below ~200 KB.
-2. That condition's F1 on LibriParty stays within ~2 absolute points of E0.
-3. The same condition runs end-to-end as a Core ML model on iPhone from a notebook, with documented cold-start and steady-state latency.
+1. **At least one condition below ~200 KB.** Met — E4 is 0.185 MB and E6 is 0.050 MB.
+2. **That condition's F1 within ~2 absolute points of E0.** Met by **E4** (0.9426 vs 0.9587, a 1.6-point gap). **Not** met by E6 (0.8704, ~9 points down).
+3. **The same condition runs end-to-end as a Core ML model on iPhone, with cold-start and steady-state latency.** Not yet done (§4.4).
 
-If criterion 1 is met but criterion 2 is not, that is still a valid outcome of the study: it would say the size–F1 trade-off on this model is sharper than knowledge distillation can absorb, and the report ends with that as its finding rather than a success claim it cannot back up.
+So the quantization track delivers a deployable result that meets criteria 1 and 2: a 185 KB INT8 model at near-baseline F1, reached by swapping the un-quantizable GRU for an LSTM and then quantizing. The distillation track meets the size criterion but not the F1 one, which is itself the predicted finding — below ~100 KB the size–F1 trade-off on this model is sharper than knowledge distillation can absorb. Criterion 3 (Core ML on device) is the one remaining step.
 
 ---
 
@@ -181,37 +173,3 @@ return F.linear(x, w_ste, self.bias)
 torch.save(vad_obj.mods['model'].state_dict(), tmp_path)
 size_mb = os.path.getsize(tmp_path) / (1024 ** 2)
 ```
-
-
----
-
-## Implementation log — RNN swap + static PTQ helpers added
-
-**Status: code written, not yet run in Colab.** I cannot execute SpeechBrain/torch here, so the cells below need one Colab run to confirm. Treat the static-PTQ helper especially as scaffolding — the eager-mode flow may need conv-bn fusion or FX-mode once the CNN's real structure is visible.
-
-What landed in `vad_experiment_colab.ipynb`:
-
-1. **`CRDNNWrapper` now takes `rnn=`** (cell: "FP32 Baseline — Load Model and Build Wrapper"). Default is unchanged (uses the pretrained GRU), so the FP32/PTQ/QAT cells behave exactly as before. The feature front-end was pulled out into `wrapper.features(wav)` so it can double as the calibration prep function.
-2. **New cell "RNN-type swap and static PTQ helpers"** (end of notebook) defines:
-   - `build_lstm_like(rnn)` — fresh `nn.LSTM` matching the GRU's dims. **Random weights** — the LSTM-FP32 reading is meaningless until it is trained. That training is the next step, not done here.
-   - `static_ptq_module(module, calib_inputs)` — `prepare → calibrate → convert`. Quantizes Conv2d (the CNN), which dynamic PTQ could not. GRU stays FP32.
-   - `load_sessions(split)` + `build_calibration_set(...)` — calibration clips from the **train** split, disjoint from the eval sessions used for F1. Returns nothing useful if the train split was not downloaded (DATA_MODE='small' may only fetch eval — set 'full' or drop dataset/train/ in place).
-
-The one-line GRU→LSTM swap:
-```python
-lstm = build_lstm_like(vad_fp32.mods['rnn'])
-wrapper_lstm = CRDNNWrapper(vad_fp32, rnn=lstm).eval()
-```
-
-Static PTQ on the CNN:
-```python
-calib = build_calibration_set(train_sessions, prep_fn=wrapper_fp32.features, n_clips=8)
-q_cnn = static_ptq_module(wrapper_fp32.cnn, calib)
-```
-
-**Also:** `vad_experiment_colab.py` moved to `archive/` — no longer maintained; the notebook is the single source of truth now.
-
-**Open risks to check on first Colab run:**
-- `build_lstm_like` reads dims off the live GRU via `find_torch_rnn`. If SpeechBrain wraps the GRU unusually, confirm input_size/hidden_size are read correctly and the LSTM output width feeds the DNN.
-- `static_ptq_module` may leave float fallbacks or error at the quant/dequant boundary if the CNN has functional ops — that's the fusion/FX caveat above.
-- `build_calibration_set` assumes train WAVs are 16 kHz mono-extractable via `wav[0]`; verify sample rate.
