@@ -69,6 +69,14 @@ PTQ+QAT (E1c) made this worse by injecting FakeQuant into CNN and GRU as well. T
 
 Dynamic PTQ is a no-op on this architecture. QAT, scoped to where dynamic PTQ can reach, makes things worse. Any meaningful compression has to actually shrink the Conv2d and recurrent layers, which means either changing how those layers are quantized (static instead of dynamic), changing the layer types themselves (LSTM in place of GRU), or making the network smaller in the first place (distillation). The next phase does all three.
 
+### 3.4 Platform: moving the re-run to local hardware
+
+The first pass above was measured on x86 Google Colab. Its own latency numbers exposed why that is the wrong place to measure: the PTQ+QAT condition reported a **P95 of 326 ms against a 54 ms median** — a 6× tail spike that reflects noisy-neighbour contention on Colab's shared, virtualised CPU, not anything about the model. Latency on a shared host is not reproducible, and the whole point of the second pass is a size–latency–F1 table that can be defended.
+
+So from the second pass onward every condition is re-run on a local Apple-Silicon (arm64) MacBook. Three reasons: (1) a dedicated machine gives reproducible latency with no shared-CPU contention; (2) arm64 matches the iPhone deployment target, so the `qnnpack` quantized backend and the measured latencies are representative of what ships; (3) Core ML conversion (§4.5) requires macOS regardless. The payoff is visible immediately — re-running the baseline locally gives **12.9 ms median with P95 ≈ median + 0.6 ms**, versus 49.8 ms and a 326 ms tail on Colab: roughly 4× faster and with the tail noise gone.
+
+The trade-off is that **latencies are no longer comparable to the first-pass Colab numbers** in §3's table, so all conditions (E0–E6) are re-run locally for one consistent table. F1 is unaffected by the platform and reproduces exactly (FP32 0.9587, dynamic PTQ 0.9594), so the size and F1 comparisons carry over. The re-run also tightens two things in the QAT conditions: fine-tuning now draws calibration clips from the **train** split rather than the eval sessions (the first pass fine-tuned on eval, a leak), and clip sampling is **seeded** so E1b/E1c are reproducible. With those fixes the local QAT readings are E1b F1 0.852 and E1c F1 0.873 — both still well below the 0.959 baseline, confirming §3.2's finding that QAT scoped to the 1.2 % `nn.Linear` only hurts.
+
 ---
 
 ## 4. Second pass: a plan that targets the 98.8 % we missed
