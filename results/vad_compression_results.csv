@@ -1,0 +1,5 @@
+Model,Format,Size (MB),Latency (ms),F1 Score,Precision,Recall
+FP32 Baseline,FP32,0.435,12.866,0.9587,0.9574,0.9606
+PTQ (Dynamic),Mixed/INT8,0.434,13.407,0.9594,0.9592,0.9603
+QAT,Mixed/INT8,0.434,14.129,0.8518,0.9966,0.747
+PTQ+QAT,Mixed/INT8,0.434,12.214,0.8726,0.9963,0.7789
