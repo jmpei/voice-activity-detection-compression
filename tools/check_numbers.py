@@ -1,7 +1,8 @@
 """Check that every number in the README/report tables comes from results/.
 
-A table cell token like 0.9426, 0.185 or 138,736 passes if some value in
-results/*.csv or results/*.json rounds to it at the printed precision. A table
+A table cell token like 0.9426, 0.185, 138,736 or 1.9% passes if some value in
+results/*.csv or results/*.json rounds to it at the printed precision (a
+percentage is compared with the value × 100). A table
 directly preceded by `<!-- check_numbers: skip -->` is not checked (used for the
 historical Colab table, whose numbers live in that notebook's outputs).
 
@@ -14,7 +15,7 @@ import sys
 
 import pandas as pd
 
-TOKEN = re.compile(r"(?<![\w.])[-−+]?(?:\d{1,3}(?:,\d{3})+|\d+\.\d+)(?![\w.])")
+TOKEN = re.compile(r"(?<![\w.§])[-−+]?(?:\d{1,3}(?:,\d{3})+|\d+\.\d+)%?(?![\w.])")
 SKIP = "<!-- check_numbers: skip -->"
 
 
@@ -45,10 +46,11 @@ def table_tokens(text):
 
 
 def matches(token, vals):
-    t = token.replace("−", "-").replace(",", "").lstrip("+")
+    pct = token.endswith("%")
+    t = token.rstrip("%").replace("−", "-").replace(",", "").lstrip("+")
     v = float(t)
     d = len(t.split(".")[1]) if "." in t else 0
-    return any(round(x, d) == v for x in vals)
+    return any(round(x * 100 if pct else x, d) == v for x in vals)
 
 
 def main(paths):

@@ -18,3 +18,12 @@ def test_table_numbers_must_trace_to_results(tmp_path, monkeypatch):
     assert check_numbers.main(["doc.md"]) == 1      # 1.5 has no source
     (tmp_path / "doc.md").write_text("| E0 | 0.9587 | 0.25 |\n|---|---|---|\n")
     assert check_numbers.main(["doc.md"]) == 0
+
+
+def test_percent_tokens_compare_value_times_100(tmp_path, monkeypatch):
+    (tmp_path / "results").mkdir()
+    (tmp_path / "results" / "d.json").write_text(json.dumps({"share": 0.0194}))
+    (tmp_path / "doc.md").write_text("| a | 1.9% | see §4.2 |\n|---|---|---|\n")
+    monkeypatch.chdir(tmp_path)
+    assert [t for _, t in check_numbers.table_tokens((tmp_path / "doc.md").read_text())] == ["1.9%"]
+    assert check_numbers.main(["doc.md"]) == 0

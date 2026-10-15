@@ -76,7 +76,7 @@ def sample_train_batch(sessions, batch, rng, clip_samples=CLIP_SAMPLES,
     """(wav [B, clip], labels [B, F]) of uniformly random 3 s clips.
 
     Uniform start positions keep the label prior of the data. (Preferring clips
-    with speech, as the first pass did, made 93% of training frames speech against
+    with speech, as the first pass did, made 91% of training frames speech against
     62% in the train split, and every model trained on it over-predicted speech.)
     `rng` is a random.Random, so every caller's sampling is seeded independently.
     """
