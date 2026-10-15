@@ -236,3 +236,15 @@ def test_student_shape_and_size():
     st = vadlib.Student()
     assert st(torch.randn(2, 301, 40)).shape == (2, 301, 1)
     assert sum(p.numel() for p in st.parameters()) == 33369
+
+
+def test_fakequant_must_be_stripped_before_dynamic_quant():
+    head = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.ReLU(), torch.nn.Linear(4, 1))
+    fq = copy.deepcopy(head)
+    assert vadlib.replace_linear_with_fakequant(fq) == 2
+    n_q = lambda m: sum(type(x).__module__.startswith("torch.ao.nn.quantized.dynamic") for x in m.modules())
+    assert n_q(vadlib.dynamic_quantize_linear(fq)) == 0          # subclass is silently skipped
+    stripped = vadlib.strip_fakequant(fq)
+    assert n_q(vadlib.dynamic_quantize_linear(stripped)) == 2
+    x = torch.randn(3, 4)
+    assert torch.equal(stripped(x), head(x))                      # same weights, plain forward

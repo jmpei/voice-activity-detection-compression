@@ -524,3 +524,27 @@ def get_student(vad, train, dev, seed, alpha):
     st = Student()
     st.load_state_dict(sd)
     return st.eval(), log
+
+
+def strip_fakequant(module):
+    """Copy with every FakeQuantLinear turned back into a plain nn.Linear (same weights).
+
+    quantize_dynamic matches exact types, so a FakeQuantLinear would be silently
+    left in FP32.
+    """
+    module = copy.deepcopy(module)
+
+    def walk(m):
+        for name, child in m.named_children():
+            if isinstance(child, FakeQuantLinear):
+                lin = nn.Linear(child.in_features, child.out_features, bias=child.bias is not None)
+                lin.load_state_dict(child.state_dict())
+                setattr(m, name, lin)
+            else:
+                walk(child)
+    walk(module)
+    return module
+
+
+QAT_RECIPE = dict(steps=60, lr=1e-5, batch=16)           # fixed recipe: norm frozen
+QAT_ORIGINAL_RECIPE = dict(steps=60, lr=1e-5, batch=1)   # first-pass recipe: train mode
