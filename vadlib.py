@@ -366,12 +366,13 @@ def finetune(vad, cnn, rnn, dnn, sessions, steps, lr, batch, seed, freeze_norm=T
 
 # ---------- training with early stopping, committed checkpoints ----------
 
-def load_or_train(name, seed, args, train_fn, ckpt_dir=CKPT_DIR):
+def load_or_train(name, seed, args, train_fn, ckpt_dir=None):
     """Load <name>_seed<seed>.pt/.json if present, else run train_fn() and save both.
 
     The JSON log stores the recipe `args`; loading a checkpoint trained with a
     different recipe raises instead of silently reusing it.
     """
+    ckpt_dir = ckpt_dir or CKPT_DIR
     pt = os.path.join(ckpt_dir, f"{name}_seed{seed}.pt")
     js = os.path.join(ckpt_dir, f"{name}_seed{seed}.json")
     args = json.loads(json.dumps(args))
