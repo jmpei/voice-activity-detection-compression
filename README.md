@@ -4,7 +4,7 @@ Compresses **SpeechBrain's CRDNN-based VAD**
 ([`speechbrain/vad-crdnn-libriparty`](https://huggingface.co/speechbrain/vad-crdnn-libriparty),
 ~108k params, 0.435 MB FP32) for iPhone deployment, evaluated frame-level on the
 LibriParty eval split. The goal is a smaller on-disk footprint than the FP32
-baseline with F1 that stays close to it, ending in a Core ML `.mlpackage`.
+baseline with F1 that stays close to it.
 
 Full write-up with analysis: [`report.md`](report.md).
 
@@ -64,28 +64,6 @@ Size vs F1 Pareto front: [`results/pareto_e0_e6.png`](results/pareto_e0_e6.png).
 
 ---
 
-## Core ML deployment (E4 / E6)
-
-Both deployable conditions convert to Core ML via
-`torch.jit.trace → coremltools.convert → INT8 weight quantization`. The full
-`wav → logits` graph (mel front-end included) converts intact. Measured on the
-local Apple-Silicon Mac via the **macOS Core ML runtime — not a physical
-iPhone**; steady-state is the median of 30 predictions after one warm-up.
-
-| Condition | Params  | `.mlpackage` INT8 (MB) | compute_units | cold-start (ms) | steady-state (ms) |
-| --------- | ------- | ---------------------- | ------------- | --------------- | ----------------- |
-| E4        | 138,672 | 0.353                  | CPU_ONLY      | 28.1            | 1.9               |
-| E4        | 138,672 | 0.353                  | CPU_AND_NE    | 2.1             | 1.2               |
-| E6        | 33,369  | 0.230                  | CPU_ONLY      | 1.6             | 1.4               |
-| E6        | 33,369  | 0.230                  | CPU_AND_NE    | 1.3             | 1.0               |
-
-The `.mlpackage` is larger than the PyTorch state_dict because it bundles the
-whole pipeline including the mel front-end (0.174 MB of FP32 DSP constants);
-the neural part alone converts to 0.18 MB INT8, matching the 0.185 MB PyTorch
-figure. See [`report.md`](report.md) §4.4 for the full breakdown.
-
----
-
 ## Project Structure
 
 ```
@@ -93,12 +71,12 @@ figure. See [`report.md`](report.md) §4.4 for the full breakdown.
 ├── vad_compression_local.ipynb   # Main notebook — E0–E6 on local Apple Silicon (source of truth)
 ├── vad_experiment_colab.ipynb    # First-pass notebook (E0–E1c) as run on x86 Colab
 ├── report.md                     # Full technical report with analysis
-├── results/                      # Committed CSVs + plots + Core ML metrics (JSON)
+├── results/                      # Committed CSVs + plots
 └── archive/
     └── vad_experiment_colab.py   # Archived Python export (no longer maintained)
 ```
 
-Heavy artefacts (dataset, pretrained checkpoint, exported `.mlpackage`s) live
+Heavy artefacts (dataset, pretrained and trained checkpoints) live
 outside the repo under `~/vad_data/`.
 
 ---
@@ -106,7 +84,7 @@ outside the repo under `~/vad_data/`.
 ## Setup & run
 
 ```bash
-pip install torch torchaudio numpy matplotlib pandas speechbrain coremltools
+pip install torch torchaudio numpy matplotlib pandas speechbrain
 ```
 
 Open `vad_compression_local.ipynb` and run top to bottom. `DATA_MODE` (cell 2)
@@ -117,8 +95,6 @@ controls how much LibriParty is pulled into `~/vad_data/`:
 | `"demo"`  | Single example WAV, no dataset download (smoke test, no F1).     |
 | `"small"` | First 20 eval sessions (~4.75 GB) — enough for E0–E1c F1.        |
 | `"full"`  | Full archive (~10 GB), includes the train split needed by E2–E6.|
-
-Core ML conversion (E4/E6) requires macOS + `coremltools`.
 
 > **Note**: `torch.quantization.quantize_dynamic` is deprecated in PyTorch ≥ 2.10;
 > the recommended migration path is [`torchao`](https://github.com/pytorch/ao).

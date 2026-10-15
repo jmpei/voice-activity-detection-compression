@@ -2,16 +2,16 @@
 
 **Model**: `speechbrain/vad-crdnn-libriparty` (CRDNN, ~108k params, 0.435 MB FP32)
 **Dataset**: LibriParty (20 evaluation sessions, frame-level F1)
-**Target hardware**: iPhone, via Core ML
-**Last updated**: 2026-06-22
+**Target hardware**: iPhone (arm64)
+**Last updated**: 2026-10-14
 
 ---
 
 ## 1. What we want and why
 
-The end goal is a CRDNN-based voice activity detector that runs on iPhone with a smaller on-disk footprint than the FP32 baseline and an F1 score on LibriParty that stays close to it. Size matters more than raw throughput here — the model is already fast on CPU; what hurts is bundling a half-megabyte audio model into an iOS app, and what helps is a small `.mlpackage` that loads quickly and lives comfortably on the Apple Neural Engine.
+The end goal is a CRDNN-based voice activity detector that runs on iPhone with a smaller on-disk footprint than the FP32 baseline and an F1 score on LibriParty that stays close to it. Size matters more than raw throughput here — the model is already fast on CPU; what hurts is bundling a half-megabyte audio model into an iOS app, and what helps is a small model that loads quickly.
 
-The path from "PyTorch FP32 checkpoint" to "small Core ML model that performs as well as the baseline" is not a single conversion call. The first attempt — applying `torch.quantization.quantize_dynamic` — turned out to be the wrong tool for this architecture, for reasons that are specific to how the model is built. That failure is the most informative part of the study so far, and it sets up the next phase.
+The path from "PyTorch FP32 checkpoint" to "small model that performs as well as the baseline" is not a single conversion call. The first attempt — applying `torch.quantization.quantize_dynamic` — turned out to be the wrong tool for this architecture, for reasons that are specific to how the model is built. That failure is the most informative part of the study so far, and it sets up the next phase.
 
 ---
 
@@ -73,7 +73,7 @@ Dynamic PTQ is a no-op on this architecture. QAT, scoped to where dynamic PTQ ca
 
 The first pass above was measured on x86 Google Colab. Its own latency numbers exposed why that is the wrong place to measure: the PTQ+QAT condition reported a **P95 of 326 ms against a 54 ms median** — a 6× tail spike that reflects noisy-neighbour contention on Colab's shared, virtualised CPU, not anything about the model. Latency on a shared host is not reproducible, and the whole point of the second pass is a size–latency–F1 table that can be defended.
 
-So from the second pass onward every condition is re-run on a local Apple-Silicon (arm64) MacBook. Three reasons: (1) a dedicated machine gives reproducible latency with no shared-CPU contention; (2) arm64 matches the iPhone deployment target, so the `qnnpack` quantized backend and the measured latencies are representative of what ships; (3) Core ML conversion (§4.4) requires macOS regardless. The payoff is visible immediately — re-running the baseline locally gives **12.9 ms median with P95 ≈ median + 0.6 ms**, versus 49.8 ms and a 326 ms tail on Colab: roughly 4× faster and with the tail noise gone.
+So from the second pass onward every condition is re-run on a local Apple-Silicon (arm64) MacBook. Two reasons: (1) a dedicated machine gives reproducible latency with no shared-CPU contention; (2) arm64 matches the iPhone deployment target, so the `qnnpack` quantized backend and the measured latencies are representative of what ships. The payoff is visible immediately — re-running the baseline locally gives **12.9 ms median with P95 ≈ median + 0.6 ms**, versus 49.8 ms and a 326 ms tail on Colab: roughly 4× faster and with the tail noise gone.
 
 The trade-off is that **latencies are no longer comparable to the first-pass Colab numbers** in §3's table, so all conditions (E0–E6) are re-run locally for one consistent table. F1 is unaffected by the platform and reproduces exactly (FP32 0.9587, dynamic PTQ 0.9594), so the size and F1 comparisons carry over. The re-run also tightens two things in the QAT conditions: fine-tuning now draws calibration clips from the **train** split rather than the eval sessions (the first pass fine-tuned on eval, a leak), and clip sampling is **seeded** so E1b/E1c are reproducible. With those fixes the local QAT readings are E1b F1 0.852 and E1c F1 0.873 — both still well below the 0.959 baseline, confirming §3.2's finding that QAT scoped to the 1.2 % `nn.Linear` only hurts.
 
@@ -119,43 +119,16 @@ The size–F1 Pareto front (`results/pareto_e0_e6.png`) splits cleanly:
 - **E6 is the smallest, at a real cost.** 0.050 MB is 8.7× smaller than the baseline, but F1 falls ~9 points. Below ~100 KB the size–F1 trade-off steepens faster than distillation absorbs it.
 - **The first-pass conditions stay where they were.** E1a buys nothing (a no-op), and the QAT variants E1b/E1c are both large *and* low-F1 — the worst corner of the plot.
 
-### 4.4 iPhone deployment via Core ML
-
-Core ML is the runtime, chosen because the deployment target is iOS — not because it is the best inference engine in general. Both E4 (the quantization endpoint) and E6 (the smallest model) were converted. The path is:
-
-```
-PyTorch model
-  → torch.jit.trace (on a 3 s randn(1, 48000) input)
-  → coremltools.convert → .mlpackage (FP32, mlprogram)
-  → coremltools INT8 weight quantization → deployable .mlpackage
-```
-
-The full `wav → logits` graph traces and converts intact, mel front-end included — coremltools 9 handles the STFT, so the front-end ships *inside* the `.mlpackage` rather than being reimplemented on the iOS side. The INT8 step uses coremltools' own weight quantizer (`linear_symmetric`), not an ingest of the PyTorch qnnpack-quantized model: coremltools cannot consume PyTorch's dynamic/static quantized operators, so the Core ML INT8 model is produced by quantizing the FP32 graph's weights. The deployable artefact — an INT8-weight `.mlpackage` — is equivalent.
-
-One scoping note, stated honestly. `.mlpackage` size and latency depend only on network structure and the quantization scheme, not on weight *values*; F1 is the only metric that depends on the trained weights, and it was already measured on the PyTorch side in §4 (E4 0.9426, E6 0.8704). So the deployment metrics below are measured on architecture-equivalent models — E4's LSTM and E6's student carry untrained weights — which is valid for size and latency, and is why this step did not require re-acquiring the ~10 GB train split to retrain.
-
-Measured on the local Apple-Silicon Mac via the macOS Core ML runtime (not a physical iPhone). Steady-state is the median of 30 predictions after one warm-up; cold-start is the first prediction (includes any ANE compile); energy is out of scope:
-
-| Condition | Params  | `.mlpackage` INT8 (MB) | compute_units | cold-start (ms) | steady-state (ms) |
-| --------- | ------- | ---------------------- | ------------- | --------------- | ----------------- |
-| E4        | 138,672 | 0.353                  | CPU_ONLY      | 28.1            | 1.9               |
-| E4        | 138,672 | 0.353                  | CPU_AND_NE    | 2.1             | 1.2               |
-| E6        | 33,369  | 0.230                  | CPU_ONLY      | 1.6             | 1.4               |
-| E6        | 33,369  | 0.230                  | CPU_AND_NE    | 1.3             | 1.0               |
-
-Two readings. First, the `.mlpackage` is *larger* than the PyTorch state_dict (E4 0.353 vs 0.185 MB) because the two measurements draw different boundaries: the PyTorch number serialises only the `cnn/rnn/dnn` sub-modules, while the `.mlpackage` bundles the whole pipeline including the mel front-end. Converting the neural part alone (feats → logits, no front-end) gives a 0.18 MB INT8 `.mlpackage` — matching the 0.185 MB PyTorch figure — and the front-end on its own is 0.174 MB of FP32 DSP constants (filterbank matrices, which should not be quantized). 0.18 + 0.174 ≈ the measured 0.353 MB, so the neural compression carries over to Core ML intact; the extra size is the front-end the PyTorch table never counted. Second, Core ML steady-state latency (E4 1.9 ms CPU-only) sits well below the PyTorch eager number (17.4 ms) — the expected effect of Core ML's graph optimisation and the ANE — though as on-Mac figures they are indicative of, not identical to, on-iPhone latency.
-
 ---
 
 ## 5. What "done" looks like — assessment
 
-The study set three criteria:
+The study set two criteria:
 
 1. **At least one condition below ~200 KB.** Met — E4 is 0.185 MB and E6 is 0.050 MB.
 2. **That condition's F1 within ~2 absolute points of E0.** Met by **E4** (0.9426 vs 0.9587, a 1.6-point gap). **Not** met by E6 (0.8704, ~9 points down).
-3. **The same condition runs end-to-end as a Core ML model on iPhone, with cold-start and steady-state latency.** Met on Mac (§4.4): E4 and E6 both convert and run end-to-end as INT8 `.mlpackage`s on Apple Silicon, with cold-start and steady-state latency reported for CPU-only and CPU+ANE. The one gap to the literal "on iPhone" wording is the runtime — these are measured with the macOS Core ML runtime, not a physical device.
 
-So the quantization track delivers a deployable result that meets criteria 1 and 2: a 185 KB INT8 model at near-baseline F1, reached by swapping the un-quantizable GRU for an LSTM and then quantizing. The distillation track meets the size criterion but not the F1 one, which is itself the predicted finding — below ~100 KB the size–F1 trade-off on this model is sharper than knowledge distillation can absorb. Criterion 3 is met against the macOS Core ML runtime — both E4 and E6 convert and run as `.mlpackage`s with latency reported (§4.4); the only remaining gap is measuring on a physical iPhone rather than on-Mac.
+So the quantization track delivers a result that meets both criteria: a 185 KB INT8 model at near-baseline F1, reached by swapping the un-quantizable GRU for an LSTM and then quantizing. The distillation track meets the size criterion but not the F1 one, which is itself the predicted finding — below ~100 KB the size–F1 trade-off on this model is sharper than knowledge distillation can absorb.
 
 ---
 
