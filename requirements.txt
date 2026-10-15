@@ -1,0 +1,13 @@
+torch==2.8.0
+torchaudio==2.8.0
+speechbrain==1.0.3
+huggingface_hub<0.30
+soundfile
+requests
+numpy
+pandas
+matplotlib
+scipy
+pytest
+nbconvert
+ipykernel
