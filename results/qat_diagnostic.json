@@ -1,0 +1,12 @@
+{
+ "original_recipe_f1": 0.9281233517366286,
+ "original_recipe_prec": 0.9862280687589197,
+ "original_recipe_rec": 0.8782771114981798,
+ "bn_restored_f1": 0.9549113903151113,
+ "bn_restored_prec": 0.9506183075450543,
+ "bn_restored_rec": 0.9607571394566751,
+ "bce_all_speech_bn_eval": 0.02480371845886111,
+ "bce_all_speech_bn_train": 2.768579864501953,
+ "n_all_speech_clips": 10,
+ "mean_train_loss_original_recipe": 2.4518120403091115
+}

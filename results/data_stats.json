@@ -1,0 +1,8 @@
+{
+ "speech_share_train": 0.623577001176914,
+ "speech_share_eval": 0.4696872060483695,
+ "speech_share_clips_uniform_sampler": 0.6180180907249451,
+ "speech_share_clips_first_pass_sampler": 0.9125765676910299,
+ "eval_tail_share_of_audio": 0.019417159888230028,
+ "eval_tail_max_s": 53.17
+}
