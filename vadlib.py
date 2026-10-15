@@ -296,3 +296,68 @@ def measure_latency(model, x, n_warmup=30, n_runs=100):
         torch.set_num_threads(threads)
     a = np.array(times)
     return dict(median=float(np.median(a)), std=float(a.std()), p95=float(np.percentile(a, 95)))
+
+
+# ---------- QAT and fine-tuning ----------
+
+class FakeQuantLinear(nn.Linear):
+    """nn.Linear that sees symmetric per-tensor INT8-rounded weights (STE backward)."""
+
+    def forward(self, x):
+        w = self.weight
+        scale = w.abs().max() / 127.0
+        w_q = (w / scale).round().clamp(-128, 127) * scale
+        return nn.functional.linear(x, w + (w_q - w).detach(), self.bias)
+
+
+def replace_linear_with_fakequant(module):
+    """Swap every nn.Linear under `module` for FakeQuantLinear in place; return the count."""
+    n = 0
+    for name, child in module.named_children():
+        if type(child) is nn.Linear:
+            fq = FakeQuantLinear(child.in_features, child.out_features, bias=child.bias is not None)
+            fq.load_state_dict(child.state_dict())
+            setattr(module, name, fq)
+            n += 1
+        else:
+            n += replace_linear_with_fakequant(child)
+    return n
+
+
+def fakequant_dnn(dnn):
+    """Copy of the DNN head with its nn.Linear layers fake-quantized (count in .n_fakequant)."""
+    dnn = copy.deepcopy(dnn)
+    dnn.n_fakequant = replace_linear_with_fakequant(dnn)
+    return dnn
+
+
+def finetune(vad, cnn, rnn, dnn, sessions, steps, lr, batch, seed, freeze_norm=True):
+    """Fine-tune copies of (cnn, rnn, dnn) end to end with BCE; return them plus the loss log.
+
+    freeze_norm=True keeps the stack in eval mode while gradients flow, so BatchNorm
+    running statistics and dropout stay as pretrained. freeze_norm=False trains in
+    train mode, where BatchNorm normalises with the statistics of the current batch.
+    """
+    cnn, rnn, dnn = (copy.deepcopy(m) for m in (cnn, rnn, dnn))
+    params = [p for m in (cnn, rnn, dnn) for p in m.parameters()]
+    for p in params:
+        p.requires_grad_(True)
+    for m in (cnn, rnn, dnn):
+        m.train(not freeze_norm)
+    rng = random.Random(seed)
+    torch.manual_seed(seed)
+    opt = torch.optim.Adam(params, lr=lr)
+    forward = crdnn_logits(cnn, rnn, dnn)
+    log = []
+    for _ in range(steps):
+        x, y = sample_train_batch(sessions, batch, rng)
+        with torch.no_grad():
+            feats = vad.mods.mean_var_norm(vad.mods.compute_features(x), torch.ones(x.shape[0]))
+        loss = nn.functional.binary_cross_entropy_with_logits(forward(feats).squeeze(-1), y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        log.append(loss.item())
+    for m in (cnn, rnn, dnn):
+        m.eval()
+    return cnn, rnn, dnn, log

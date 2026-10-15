@@ -1,3 +1,4 @@
+import copy
 import json
 import random
 
@@ -155,3 +156,39 @@ def test_measure_latency_restores_threads():
     before = torch.get_num_threads()
     r = vadlib.measure_latency(torch.nn.Linear(4, 4), torch.randn(1, 4), n_warmup=2, n_runs=5)
     assert set(r) == {"median", "std", "p95"} and torch.get_num_threads() == before
+
+
+# ---------- QAT / fine-tuning ----------
+
+def _bn_buffers(module):
+    return {k: v.clone() for k, v in module.state_dict().items() if "running" in k}
+
+
+@needs_data
+def test_fakequant_scope_is_the_three_dnn_linears(vad):
+    assert vadlib.fakequant_dnn(vad.mods.dnn).n_fakequant == 3
+    whole = copy.deepcopy(vadlib.CRDNNWrapper(vad))
+    assert vadlib.replace_linear_with_fakequant(whole) == 3   # CNN/GRU hold no nn.Linear
+
+
+@needs_data
+def test_finetune_frozen_norm_keeps_bn_stats(vad, eval3):
+    before = _bn_buffers(vad.mods.dnn)
+    w_before = copy.deepcopy(vad.mods.dnn.state_dict())
+    cnn, rnn, dnn, log = vadlib.finetune(vad, vad.mods.cnn, vad.mods.rnn, vad.mods.dnn, eval3,
+                                         steps=2, lr=1e-3, batch=2, seed=0, freeze_norm=True)
+    after = _bn_buffers(dnn)
+    assert all(torch.equal(before[k], after[k]) for k in before)
+    assert any(not torch.equal(w_before[k], v) for k, v in dnn.state_dict().items() if "running" not in k)
+    assert all(torch.equal(w_before[k], v) for k, v in vad.mods.dnn.state_dict().items())  # original untouched
+    assert len(log) == 2
+
+
+@needs_data
+def test_finetune_train_mode_moves_bn_stats(vad, eval3):
+    before = _bn_buffers(vad.mods.dnn)
+    _, _, dnn, _ = vadlib.finetune(vad, vad.mods.cnn, vad.mods.rnn, vad.mods.dnn, eval3,
+                                   steps=2, lr=1e-3, batch=1, seed=0, freeze_norm=False)
+    after = _bn_buffers(dnn)
+    assert any(not torch.equal(before[k], after[k]) for k in before)
+    assert not vad.mods.dnn.training
