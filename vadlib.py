@@ -19,6 +19,7 @@ import torchaudio
 DATA_ROOT = os.path.expanduser(os.environ.get("VAD_DATA", "~/vad_data"))
 LIBRIPARTY_DIR = os.path.join(DATA_ROOT, "LibriParty")
 PRETRAINED_DIR = os.path.join(DATA_ROOT, "pretrained_vad")
+CKPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
 
 torch.backends.quantized.engine = (
     "qnnpack" if platform.machine() in ("arm64", "aarch64") else "fbgemm")
@@ -361,3 +362,165 @@ def finetune(vad, cnn, rnn, dnn, sessions, steps, lr, batch, seed, freeze_norm=T
     for m in (cnn, rnn, dnn):
         m.eval()
     return cnn, rnn, dnn, log
+
+
+# ---------- training with early stopping, committed checkpoints ----------
+
+def load_or_train(name, seed, args, train_fn, ckpt_dir=CKPT_DIR):
+    """Load <name>_seed<seed>.pt/.json if present, else run train_fn() and save both.
+
+    The JSON log stores the recipe `args`; loading a checkpoint trained with a
+    different recipe raises instead of silently reusing it.
+    """
+    pt = os.path.join(ckpt_dir, f"{name}_seed{seed}.pt")
+    js = os.path.join(ckpt_dir, f"{name}_seed{seed}.json")
+    args = json.loads(json.dumps(args))
+    if os.path.exists(pt):
+        with open(js) as f:
+            log = json.load(f)
+        if log["args"] != args:
+            raise ValueError(f"{pt} was trained with recipe {log['args']}, not {args}")
+        return torch.load(pt), log
+    state, log = train_fn()
+    log["args"] = args
+    os.makedirs(ckpt_dir, exist_ok=True)
+    torch.save(state, pt)
+    with open(js, "w") as f:
+        json.dump(log, f, indent=1)
+    return state, log
+
+
+def _train_early_stop(module, loss_fn, dev_f1_fn, rng, max_steps, eval_every, lr, patience):
+    """Adam + cosine LR + grad-clip 1.0; keep the weights with the best dev F1."""
+    params = [p for p in module.parameters() if p.requires_grad]
+    opt = torch.optim.Adam(params, lr=lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
+    best, best_sd, best_step, wait, curve = -1.0, None, 0, 0, []
+    for step in range(1, max_steps + 1):
+        module.train()
+        loss = loss_fn(rng)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        sched.step()
+        if step % eval_every == 0:
+            module.eval()
+            f1 = dev_f1_fn(module)
+            curve.append(dict(step=step, loss=loss.item(), dev_f1=f1))
+            if f1 > best:
+                best, best_sd, best_step, wait = f1, copy.deepcopy(module.state_dict()), step, 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+    module.load_state_dict(best_sd)
+    module.eval()
+    return best_sd, dict(curve=curve, best_dev_f1=best, best_step=best_step, steps_run=step)
+
+
+def _feats(vad, x):
+    with torch.no_grad():
+        return vad.mods.mean_var_norm(vad.mods.compute_features(x), torch.ones(x.shape[0]))
+
+
+def build_lstm_like(rnn):
+    """Fresh nn.LSTM with the dimensions of the GRU inside SpeechBrain's RNN wrapper."""
+    gru = next(m for m in rnn.modules() if isinstance(m, nn.GRU))
+    return nn.LSTM(gru.input_size, gru.hidden_size, num_layers=gru.num_layers,
+                   bidirectional=gru.bidirectional, dropout=gru.dropout, batch_first=True)
+
+
+def train_lstm_only(vad, train, dev, seed, max_steps=3000, eval_every=250, batch=16,
+                    lr=5e-4, patience=6):
+    """GRU -> fresh LSTM, trained with BCE while the pretrained CNN and DNN stay frozen."""
+    torch.manual_seed(seed)
+    lstm = build_lstm_like(vad.mods.rnn)
+    cnn, dnn = vad.mods.cnn, vad.mods.dnn
+
+    def loss_fn(rng):
+        x, y = sample_train_batch(train, batch, rng)
+        with torch.no_grad():
+            o = cnn(_feats(vad, x))
+        o, _ = lstm(o.reshape(o.shape[0], o.shape[1], -1))
+        return nn.functional.binary_cross_entropy_with_logits(dnn(o).squeeze(-1), y)
+
+    return _train_early_stop(lstm, loss_fn,
+                             lambda m: eval_f1(vad, crdnn_logits(cnn, m, dnn), dev)["f1"],
+                             random.Random(seed), max_steps, eval_every, lr, patience)
+
+
+class Student(nn.Module):
+    """Compact CRDNN on mel feats: 2 conv blocks (8, 16 ch) + 2-layer biLSTM(16) + linear head."""
+
+    def __init__(self, n_mels=40, hidden=16):
+        super().__init__()
+
+        def blk(ci, co):
+            return nn.Sequential(
+                nn.Conv2d(ci, co, 3, padding=1), nn.LeakyReLU(0.01),
+                nn.Conv2d(co, co, 3, padding=1), nn.LeakyReLU(0.01),
+                nn.MaxPool2d((1, 2)))
+        self.cnn = nn.Sequential(blk(1, 8), blk(8, 16))           # freq 40 -> 20 -> 10
+        self.rnn = nn.LSTM(16 * (n_mels // 4), hidden, num_layers=2,
+                           bidirectional=True, batch_first=True)
+        self.head = nn.Linear(2 * hidden, 1)
+
+    def forward(self, feats):                                      # [B, T, 40]
+        x = self.cnn(feats.unsqueeze(1))                           # [B, C, T, F]
+        B, C, T, Fq = x.shape
+        x, _ = self.rnn(x.permute(0, 2, 1, 3).reshape(B, T, C * Fq))
+        return self.head(x)
+
+
+def distill_loss(student_logits, teacher_logits, labels, alpha, temp):
+    """alpha * T^2 * BCE(s/T, sigmoid(t/T)) + (1 - alpha) * BCE(s, labels)."""
+    soft = nn.functional.binary_cross_entropy_with_logits(
+        student_logits / temp, torch.sigmoid(teacher_logits / temp)) * temp ** 2
+    hard = nn.functional.binary_cross_entropy_with_logits(student_logits, labels)
+    return alpha * soft + (1 - alpha) * hard
+
+
+def train_student(vad, train, dev, seed, alpha, temp=2.0, max_steps=2500, eval_every=250,
+                  batch=16, lr=5e-4, patience=6):
+    """Train a Student from scratch; alpha=0.5 distils from the FP32 teacher, alpha=0 is hard labels only."""
+    torch.manual_seed(seed)
+    student = Student()
+    teacher = crdnn_logits(vad.mods.cnn, vad.mods.rnn, vad.mods.dnn)
+
+    def loss_fn(rng):
+        x, y = sample_train_batch(train, batch, rng)
+        f = _feats(vad, x)
+        with torch.no_grad():
+            t = teacher(f).squeeze(-1)
+        return distill_loss(student(f).squeeze(-1), t, y, alpha, temp)
+
+    return _train_early_stop(student, loss_fn, lambda m: eval_f1(vad, m, dev)["f1"],
+                             random.Random(seed), max_steps, eval_every, lr, patience)
+
+
+# ---------- recipes shared by the notebook and any pre-training run ----------
+
+SEEDS = (0, 1, 2)
+N_DEV = 10   # dev sessions used for early stopping
+LSTM_RECIPE = dict(max_steps=3000, eval_every=250, batch=16, lr=5e-4, patience=6)
+STUDENT_RECIPE = dict(temp=2.0, max_steps=2500, eval_every=250, batch=16, lr=5e-4, patience=6)
+
+
+def get_lstm(vad, train, dev, seed):
+    """E3 LSTM for `seed` (trained once, then loaded from checkpoints/)."""
+    sd, log = load_or_train("e3_lstm", seed, {**LSTM_RECIPE, "n_dev": len(dev)},
+                            lambda: train_lstm_only(vad, train, dev, seed, **LSTM_RECIPE))
+    lstm = build_lstm_like(vad.mods.rnn)
+    lstm.load_state_dict(sd)
+    return lstm.eval(), log
+
+
+def get_student(vad, train, dev, seed, alpha):
+    """E5 student (alpha=0.5, distilled) or hard-label control (alpha=0) for `seed`."""
+    name = "e5_student" if alpha > 0 else "e5_hard"
+    sd, log = load_or_train(name, seed, {**STUDENT_RECIPE, "alpha": alpha, "n_dev": len(dev)},
+                            lambda: train_student(vad, train, dev, seed, alpha, **STUDENT_RECIPE))
+    st = Student()
+    st.load_state_dict(sd)
+    return st.eval(), log

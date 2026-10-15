@@ -192,3 +192,47 @@ def test_finetune_train_mode_moves_bn_stats(vad, eval3):
     after = _bn_buffers(dnn)
     assert any(not torch.equal(before[k], after[k]) for k in before)
     assert not vad.mods.dnn.training
+
+
+# ---------- training: checkpoints, distillation loss ----------
+
+def test_load_or_train_trains_once_then_loads(tmp_path):
+    calls = []
+
+    def train_fn():
+        calls.append(1)
+        return torch.nn.Linear(2, 1).state_dict(), {"best_dev_f1": 0.5}
+
+    args = {"lr": 1e-3, "steps": 10}
+    sd1, log1 = vadlib.load_or_train("m", 0, args, train_fn, ckpt_dir=tmp_path)
+    sd2, log2 = vadlib.load_or_train("m", 0, args, train_fn, ckpt_dir=tmp_path)
+    assert len(calls) == 1 and log2 == log1 and log1["args"] == args
+    assert all(torch.equal(sd1[k], sd2[k]) for k in sd1)
+    assert (tmp_path / "m_seed0.pt").exists() and (tmp_path / "m_seed0.json").exists()
+
+
+def test_load_or_train_rejects_recipe_mismatch(tmp_path):
+    train_fn = lambda: (torch.nn.Linear(2, 1).state_dict(), {})
+    vadlib.load_or_train("m", 0, {"lr": 1e-3}, train_fn, ckpt_dir=tmp_path)
+    with pytest.raises(ValueError, match="recipe"):
+        vadlib.load_or_train("m", 0, {"lr": 5e-4}, train_fn, ckpt_dir=tmp_path)
+
+
+def test_distill_loss_alpha0_is_plain_bce():
+    torch.manual_seed(0)
+    s, t, y = torch.randn(2, 9), torch.randn(2, 9), (torch.rand(2, 9) > 0.5).float()
+    assert torch.equal(vadlib.distill_loss(s, t, y, alpha=0.0, temp=2.0),
+                       torch.nn.functional.binary_cross_entropy_with_logits(s, y))
+
+
+def test_distill_loss_soft_term_minimised_at_teacher():
+    t, y = torch.randn(1, 50), torch.zeros(1, 50)
+    at_teacher = vadlib.distill_loss(t.clone(), t, y, alpha=1.0, temp=2.0)
+    off = vadlib.distill_loss(t + 1.0, t, y, alpha=1.0, temp=2.0)
+    assert at_teacher < off
+
+
+def test_student_shape_and_size():
+    st = vadlib.Student()
+    assert st(torch.randn(2, 301, 40)).shape == (2, 301, 1)
+    assert sum(p.numel() for p in st.parameters()) == 33369
