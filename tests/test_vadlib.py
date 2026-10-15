@@ -87,3 +87,71 @@ def test_paired_delta_identical_inputs():
     a = np.array([0.9, 0.8, 0.95])
     d = vadlib.paired_delta(a, a)
     assert d["mean"] == 0.0 and d["p_wilcoxon"] == 1.0
+
+
+# ---------- model wrapper, eval path, quant helpers (pretrained model + eval data) ----------
+
+DATA_ROOT = vadlib.DATA_ROOT
+needs_data = pytest.mark.skipif(
+    not (vadlib.os.path.isdir(vadlib.os.path.join(DATA_ROOT, "pretrained_vad"))
+         and vadlib.os.path.isdir(vadlib.os.path.join(DATA_ROOT, "LibriParty", "dataset", "eval"))),
+    reason="pretrained model or LibriParty eval split not under ~/vad_data")
+
+
+@pytest.fixture(scope="module")
+def vad():
+    return vadlib.load_vad()
+
+
+@pytest.fixture(scope="module")
+def eval3():
+    return vadlib.load_sessions(vadlib.LIBRIPARTY_DIR, "eval", 3)
+
+
+@needs_data
+def test_wrapper_matches_native_chunk(vad, eval3):
+    wav = vadlib.torchaudio.load(eval3[0][0])[0][:, :48000]
+    native = vad.get_speech_prob_chunk(wav)
+    ours = torch.sigmoid(vadlib.CRDNNWrapper(vad)(wav))
+    assert torch.equal(native, ours)
+
+
+@needs_data
+def test_swapped_eval_path_reproduces_native_probs(vad, eval3):
+    native = vad.get_speech_prob_file(eval3[0][0])
+    with vadlib.swapped_chunk_fn(vad, vadlib.crdnn_logits(vad.mods.cnn, vad.mods.rnn, vad.mods.dnn)):
+        ours = vad.get_speech_prob_file(eval3[0][0])
+    assert (native - ours).abs().max().item() == 0.0
+    assert "get_speech_prob_chunk" not in vars(vad)          # patch removed
+
+
+@needs_data
+def test_swapped_eval_f1_equals_native_f1(vad, eval3):
+    native = vadlib.eval_native_f1(vad, eval3)
+    ours = vadlib.eval_f1(vad, vadlib.crdnn_logits(vad.mods.cnn, vad.mods.rnn, vad.mods.dnn), eval3)
+    assert native["per_session"] == ours["per_session"]
+
+
+@needs_data
+def test_static_ptq_cnn_is_int8_drop_in(vad, eval3):
+    feats = vadlib.build_calib_feats(vad, eval3, n_clips=2, seed=0)
+    q = vadlib.static_ptq_module(vad.mods.cnn, feats)
+    assert any("Quantized" in type(m).__name__ or type(m).__module__.startswith("torch.ao.nn.quantized")
+               for m in q.modules())
+    with torch.no_grad():
+        assert q(feats[0]).shape == vad.mods.cnn(feats[0]).shape
+    assert vadlib.modules_size_mb(cnn=q) < vadlib.modules_size_mb(cnn=vad.mods.cnn)
+
+
+def test_dynamic_quantize_lstm():
+    lstm = torch.nn.LSTM(8, 4, num_layers=2, bidirectional=True, batch_first=True)
+    q = vadlib.dynamic_quantize_rnn(lstm)
+    assert type(q).__module__.startswith("torch.ao.nn.quantized.dynamic")
+    out, _ = q(torch.randn(1, 5, 8))
+    assert out.shape == (1, 5, 8)
+
+
+def test_measure_latency_restores_threads():
+    before = torch.get_num_threads()
+    r = vadlib.measure_latency(torch.nn.Linear(4, 4), torch.randn(1, 4), n_warmup=2, n_runs=5)
+    assert set(r) == {"median", "std", "p95"} and torch.get_num_threads() == before
