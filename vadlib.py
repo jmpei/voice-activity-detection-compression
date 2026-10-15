@@ -65,21 +65,18 @@ def load_sessions(root, split, n=None):
 
 def sample_train_batch(sessions, batch, rng, clip_samples=CLIP_SAMPLES,
                        target_frames=CLIP_FRAMES, frame_stride=FRAME_STRIDE):
-    """(wav [B, clip], labels [B, F]) of random 3 s clips, preferring speech ratio > 0.2.
+    """(wav [B, clip], labels [B, F]) of uniformly random 3 s clips.
 
+    Uniform start positions keep the label prior of the data. (Preferring clips
+    with speech, as the first pass did, made 93% of training frames speech against
+    62% in the train split, and every model trained on it over-predicted speech.)
     `rng` is a random.Random, so every caller's sampling is seeded independently.
     """
     xs, ys = [], []
     for _ in range(batch):
         wav_path, gt, _ = rng.choice(sessions)
         wav = torchaudio.load(wav_path)[0][0]
-        start = 0
-        if wav.numel() > clip_samples:
-            for _try in range(8):
-                start = rng.randint(0, wav.numel() - clip_samples)
-                f0 = start // frame_stride
-                if np.mean(gt[f0:f0 + target_frames]) > 0.2:
-                    break
+        start = rng.randint(0, max(0, wav.numel() - clip_samples))
         x = wav[start:start + clip_samples]
         x = torch.cat([x, torch.zeros(clip_samples - x.numel())])
         f0 = start // frame_stride
@@ -502,6 +499,7 @@ def train_student(vad, train, dev, seed, alpha, temp=2.0, max_steps=2500, eval_e
 
 # ---------- recipes shared by the notebook and any pre-training run ----------
 
+SAMPLER = "uniform-3s"   # recorded in checkpoint recipes; see sample_train_batch
 SEEDS = (0, 1, 2)
 N_DEV = 10   # dev sessions used for early stopping
 LSTM_RECIPE = dict(max_steps=3000, eval_every=250, batch=16, lr=5e-4, patience=6)
@@ -510,7 +508,7 @@ STUDENT_RECIPE = dict(temp=2.0, max_steps=2500, eval_every=250, batch=16, lr=5e-
 
 def get_lstm(vad, train, dev, seed):
     """E3 LSTM for `seed` (trained once, then loaded from checkpoints/)."""
-    sd, log = load_or_train("e3_lstm", seed, {**LSTM_RECIPE, "n_dev": len(dev)},
+    sd, log = load_or_train("e3_lstm", seed, {**LSTM_RECIPE, "n_dev": len(dev), "sampler": SAMPLER},
                             lambda: train_lstm_only(vad, train, dev, seed, **LSTM_RECIPE))
     lstm = build_lstm_like(vad.mods.rnn)
     lstm.load_state_dict(sd)
@@ -520,7 +518,7 @@ def get_lstm(vad, train, dev, seed):
 def get_student(vad, train, dev, seed, alpha):
     """E5 student (alpha=0.5, distilled) or hard-label control (alpha=0) for `seed`."""
     name = "e5_student" if alpha > 0 else "e5_hard"
-    sd, log = load_or_train(name, seed, {**STUDENT_RECIPE, "alpha": alpha, "n_dev": len(dev)},
+    sd, log = load_or_train(name, seed, {**STUDENT_RECIPE, "alpha": alpha, "n_dev": len(dev), "sampler": SAMPLER},
                             lambda: train_student(vad, train, dev, seed, alpha, **STUDENT_RECIPE))
     st = Student()
     st.load_state_dict(sd)

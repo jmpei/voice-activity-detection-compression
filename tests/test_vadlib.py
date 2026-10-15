@@ -248,3 +248,19 @@ def test_fakequant_must_be_stripped_before_dynamic_quant():
     assert n_q(vadlib.dynamic_quantize_linear(stripped)) == 2
     x = torch.randn(3, 4)
     assert torch.equal(stripped(x), head(x))                      # same weights, plain forward
+
+
+def test_sample_train_batch_has_no_speech_preference(tmp_path):
+    wav_path = tmp_path / "w.wav"
+    sf.write(wav_path, np.zeros(16000 * 60, dtype=np.float32), 16000)
+    gt = np.zeros(6001, dtype=int)
+    gt[:1200] = 1                                        # 20% of the session is speech
+    _, y = vadlib.sample_train_batch([(str(wav_path), gt, len(gt))], 400, random.Random(0))
+    assert abs(y.mean().item() - 0.2) < 0.05             # label prior matches the data
+
+
+def test_old_sampler_checkpoints_are_rejected(tmp_path):
+    train_fn = lambda: (torch.nn.Linear(2, 1).state_dict(), {})
+    vadlib.load_or_train("m", 0, {"lr": 1e-3}, train_fn, ckpt_dir=tmp_path)
+    with pytest.raises(ValueError, match="recipe"):
+        vadlib.load_or_train("m", 0, {"lr": 1e-3, "sampler": vadlib.SAMPLER}, train_fn, ckpt_dir=tmp_path)
