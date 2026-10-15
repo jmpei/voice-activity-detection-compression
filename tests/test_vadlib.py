@@ -264,3 +264,13 @@ def test_old_sampler_checkpoints_are_rejected(tmp_path):
     vadlib.load_or_train("m", 0, {"lr": 1e-3}, train_fn, ckpt_dir=tmp_path)
     with pytest.raises(ValueError, match="recipe"):
         vadlib.load_or_train("m", 0, {"lr": 1e-3, "sampler": vadlib.SAMPLER}, train_fn, ckpt_dir=tmp_path)
+
+
+def test_load_sessions_labels_cover_the_whole_wav(tmp_path):
+    d = tmp_path / "dataset" / "eval" / "session_0"
+    d.mkdir(parents=True)
+    sf.write(d / "session_0_mixture.wav", np.zeros(16000 * 10, dtype=np.float32), 16000)
+    (d / "session_0.json").write_text(json.dumps({"1": [{"start": 1.0, "stop": 4.0}]}))
+    (wav, labels, total), = vadlib.load_sessions(str(tmp_path), "eval")
+    assert total == len(labels) == 16000 * 10 // 160 + 1    # frames of the whole wav
+    assert labels[100:400].all() and labels[400:].sum() == 0  # silent tail after the last utterance is scored
