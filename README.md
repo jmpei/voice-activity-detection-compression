@@ -35,8 +35,9 @@ input, Apple-Silicon Mac.
 - **Dynamic PTQ is a no-op here.** It converts only `nn.Linear`, which is 1.2% of
   this model's parameters; the Conv2d and GRU weights stay FP32.
 - **E4 is the size/F1 sweet spot: 0.185 MB (−57%), 1.4 F1 points below E0.**
-  `quantize_dynamic` supports LSTM but not GRU, so the GRU is swapped for a
-  trained LSTM and then quantized. Quantization itself costs nothing (E3 → E4);
+  The GRU cannot be dynamically quantized inside SpeechBrain's RNN wrapper,
+  which calls `flatten_parameters()` on every forward pass and the quantized GRU
+  has no such method, so the GRU is swapped for a trained LSTM and then quantized. Quantization itself costs nothing (E3 → E4);
   the gap comes from the GRU → LSTM swap.
 - **QAT adds nothing measurable** over the same fine-tuning without FakeQuant
   (E1b − FT = −0.0003, CI spans 0). The QAT loss in earlier runs (up to 11
